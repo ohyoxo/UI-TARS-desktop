@@ -4,11 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { LocalBrowser } from '@agent-infra/browser';
+import { LocalBrowser, Page } from '@agent-infra/browser';
 import { BrowserOperator } from '@ui-tars/operator-browser';
-import { ConsoleLogger, EventStream, Tool, ToolDefinition, z } from '@multimodal/mcp-agent';
-import { EventType } from '@multimodal/mcp-agent';
-import { Page } from 'puppeteer-core';
+import { ConsoleLogger, AgentEventStream, Tool, ToolDefinition, z } from '@mcp-agent/core';
+import { ImageCompressor, formatBytes } from '../shared/utils';
 
 /**
  * Coordinate type definition
@@ -60,7 +59,7 @@ export interface GUIAgentOptions {
   /** Scaling factors for coordinates */
   factors?: [number, number];
   /** Event stream instance for injecting environment info */
-  eventStream?: EventStream;
+  eventStream?: AgentEventStream.Processor;
 }
 
 /**
@@ -74,7 +73,7 @@ export class BrowserGUIAgent {
   private browserGUIAgentTool: ToolDefinition;
   private logger: ConsoleLogger;
   private factors: [number, number];
-  private eventStream?: EventStream;
+  private eventStream?: AgentEventStream.Processor;
 
   /**
    * Creates a new GUI Agent
@@ -242,7 +241,7 @@ wait()                                         - Wait 5 seconds and take a scree
       // If content is available, add it to event stream
       if (markdown && markdown.trim()) {
         // Create an environment input event with the markdown content
-        const event = this.eventStream.createEvent(EventType.ENVIRONMENT_INPUT, {
+        const event = this.eventStream.createEvent('environment_input', {
           content: markdown,
           description: 'Page Content After Browser Action',
         });
@@ -263,7 +262,7 @@ wait()                                         - Wait 5 seconds and take a scree
    * Set the event stream instance
    * @param eventStream - The event stream instance
    */
-  public setEventStream(eventStream: EventStream): void {
+  public setEventStream(eventStream: AgentEventStream.Processor): void {
     this.eventStream = eventStream;
   }
 
@@ -280,7 +279,10 @@ wait()                                         - Wait 5 seconds and take a scree
    * - Extracts image dimensions
    * - Sends the screenshot to the event stream
    */
-  async onEachAgentLoopStart(eventStream: EventStream, isReplaySnapshot = false): Promise<void> {
+  async onEachAgentLoopStart(
+    eventStream: AgentEventStream.Processor,
+    isReplaySnapshot = false,
+  ): Promise<void> {
     console.log('Agent Loop Start');
 
     // Store the event stream for later use
@@ -292,7 +294,7 @@ wait()                                         - Wait 5 seconds and take a scree
     // Handle replay state
     if (isReplaySnapshot) {
       // Send screenshot to event stream as environment input
-      const event = eventStream.createEvent(EventType.ENVIRONMENT_INPUT, {
+      const event = eventStream.createEvent('environment_input', {
         content: [
           {
             type: 'image_url',
@@ -317,10 +319,40 @@ wait()                                         - Wait 5 seconds and take a scree
       // Extract image dimensions from screenshot
       this.extractImageDimensionsFromBase64(output.base64);
 
+      // Calculate original image size
+      const originalBase64Data = output.base64.replace(/^data:image\/\w+;base64,/, '');
+      const originalBuffer = Buffer.from(originalBase64Data, 'base64');
+      const originalSize = originalBuffer.length;
+
+      // Compress the image
+      const imageCompressor = new ImageCompressor({
+        quality: 80,
+        format: 'webp',
+      });
+
+      const compressedBuffer = await imageCompressor.compressToBuffer(originalBuffer);
+      const compressedSize = compressedBuffer.length;
+
+      // Convert compressed buffer to base64
+      const compressedBase64 = `data:image/webp;base64,${compressedBuffer.toString('base64')}`;
+
+      // Calculate compression ratio and percentage
+      const compressionRatio = originalSize / compressedSize;
+      const compressionPercentage = ((1 - compressedSize / originalSize) * 100).toFixed(2);
+
+      // Log compression stats
+      this.logger.info('Screenshot compression stats:', {
+        original: formatBytes(originalSize),
+        compressed: formatBytes(compressedSize),
+        ratio: `${compressionRatio.toFixed(2)}x (${compressionPercentage}% smaller)`,
+        dimensions: `${this.screenWidth}x${this.screenHeight}`,
+        format: 'webp',
+        quality: 20,
+        time: `${screenshotTime} ms`,
+      });
+
       // Calculate image size
-      const base64Data = output.base64.replace(/^data:image\/\w+;base64,/, '');
-      const sizeInBytes = Math.ceil((base64Data.length * 3) / 4);
-      const sizeInKB = (sizeInBytes / 1024).toFixed(2);
+      const sizeInKB = (compressedSize / 1024).toFixed(2);
 
       // FIXME: using logger
       console.log('Screenshot info:', {
@@ -328,15 +360,20 @@ wait()                                         - Wait 5 seconds and take a scree
         height: this.screenHeight,
         size: `${sizeInKB} KB`,
         time: `${screenshotTime} ms`,
+        compression: `${
+          originalSize / 1024 > 1024
+            ? (originalSize / 1024 / 1024).toFixed(2) + ' MB'
+            : (originalSize / 1024).toFixed(2) + ' KB'
+        } → ${formatBytes(compressedSize)} (${compressionPercentage}% reduction)`,
       });
 
       // Send screenshot to event stream as environment input
-      const event = eventStream.createEvent(EventType.ENVIRONMENT_INPUT, {
+      const event = eventStream.createEvent('environment_input', {
         content: [
           {
             type: 'image_url',
             image_url: {
-              url: this.addBase64ImagePrefix(output.base64),
+              url: compressedBase64,
             },
           },
         ],

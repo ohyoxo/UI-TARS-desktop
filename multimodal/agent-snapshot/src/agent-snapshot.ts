@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/ban-types */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /*
  * Copyright (c) 2025 Bytedance, Inc. and its affiliates.
@@ -10,10 +11,9 @@ import { Agent } from '@multimodal/agent';
 import {
   AgentRunOptions,
   AgentRunObjectOptions,
-  Event,
+  AgentEventStream,
   isStreamingOptions,
   isAgentRunObjectOptions,
-  AssistantMessageEvent,
 } from '@multimodal/agent-interface';
 import {
   AgentSnapshotOptions,
@@ -67,7 +67,15 @@ export class AgentSnapshot {
 
     process.env.TEST = 'true';
 
-    const agentSnapshotRun = this.run.bind(this);
+    const agentSnapshotProto = Object.getPrototypeOf(this);
+    const methodsToPreserve: Record<string, Function> = {};
+
+    Object.getOwnPropertyNames(agentSnapshotProto).forEach((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(agentSnapshotProto, key);
+      if (typeof descriptor?.value === 'function' && key !== 'constructor') {
+        methodsToPreserve[key] = (this[key as keyof this] as Function).bind(this);
+      }
+    });
 
     // Set prototype chain to inherit from the original agent
     Object.setPrototypeOf(this, Object.getPrototypeOf(agent));
@@ -85,7 +93,9 @@ export class AgentSnapshot {
       }
     });
 
-    this.run = agentSnapshotRun;
+    Object.entries(methodsToPreserve).forEach(([key, method]) => {
+      (this[key as keyof this] as unknown) = method;
+    });
   }
 
   /**
@@ -97,7 +107,7 @@ export class AgentSnapshot {
    * @param input - String input for a basic text message
    * @returns The final response event from the agent (stream is false)
    */
-  async run(input: string): Promise<AssistantMessageEvent>;
+  async run(input: string): Promise<AgentEventStream.AssistantMessageEvent>;
 
   /**
    * Run method with interface aligned with Agent.run
@@ -105,7 +115,9 @@ export class AgentSnapshot {
    * @param options - Object with input and optional configuration
    * @returns The final response event from the agent (when stream is false)
    */
-  async run(options: AgentRunObjectOptions & { stream?: false }): Promise<AssistantMessageEvent>;
+  async run(
+    options: AgentRunObjectOptions & { stream?: false },
+  ): Promise<AgentEventStream.AssistantMessageEvent>;
 
   /**
    * Run method with interface aligned with Agent.run
@@ -113,7 +125,9 @@ export class AgentSnapshot {
    * @param options - Object with input and streaming enabled
    * @returns An async iterable of streaming events
    */
-  async run(options: AgentRunObjectOptions & { stream: true }): Promise<AsyncIterable<Event>>;
+  async run(
+    options: AgentRunObjectOptions & { stream: true },
+  ): Promise<AsyncIterable<AgentEventStream.Event>>;
 
   /**
    * Implementation of the run method to handle all overload cases
@@ -121,7 +135,9 @@ export class AgentSnapshot {
    *
    * @param runOptions - Input options
    */
-  async run(runOptions: AgentRunOptions): Promise<AssistantMessageEvent | AsyncIterable<Event>> {
+  async run(
+    runOptions: AgentRunOptions,
+  ): Promise<AgentEventStream.AssistantMessageEvent | AsyncIterable<AgentEventStream.Event>> {
     logger.info(
       `AgentSnapshot.run called with ${typeof runOptions === 'string' ? 'string' : 'options object'}`,
     );
@@ -321,7 +337,7 @@ export class AgentSnapshot {
       const isStreaming =
         typeof runOptions === 'object' && isStreamingOptions(runOptions as AgentRunObjectOptions);
       let response;
-      let events: Event[] = [];
+      let events: AgentEventStream.Event[] = [];
 
       // Set the `isReplay` flag to tell the agent that is replay mode.
       this.hostedAgent._setIsReplay();
@@ -334,7 +350,7 @@ export class AgentSnapshot {
 
         // Consume all events from the stream
         logger.info(`Processing streaming response...`);
-        for await (const event of asyncIterable as AsyncIterable<Event>) {
+        for await (const event of asyncIterable as AsyncIterable<AgentEventStream.Event>) {
           // Check for errors between stream events
           if (this.replayHook.hasError()) {
             const error = this.replayHook.getLastError();
@@ -368,8 +384,10 @@ export class AgentSnapshot {
       }
 
       // Verify execution metrics
-      const executedLoops = this.hostedAgent.getCurrentLoopIteration();
-      logger.info(`Executed ${executedLoops} agent loops out of ${loopCount} expected loops`);
+      const executedLoops = this.hostedAgent.getCurrentLoopIteration() - 1;
+      logger.info(
+        `Executed ${executedLoops} agent loops out of ${loopCount} expected loops: ${JSON.stringify(this.options)}`,
+      );
 
       if (executedLoops !== loopCount) {
         throw new Error(
