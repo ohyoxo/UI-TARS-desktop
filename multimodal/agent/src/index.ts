@@ -4,6 +4,7 @@
  */
 
 // Export Agent core
+export { v4 as uuidv4 } from 'uuid';
 export * from '@multimodal/agent-interface';
 
 // Export Agent core
@@ -14,4 +15,5 @@ export * from './tool-call-engine';
 
 // Export logger
 export { getLogger, LogLevel, ConsoleLogger } from './utils/logger';
-export { ModelResolver, ResolvedModel } from '@multimodal/model-provider';
+export { ModelResolver } from '@multimodal/model-provider';
+export type { ResolvedModel } from '@multimodal/model-provider';

@@ -1,4 +1,4 @@
-import { ToolDefinition } from '@multimodal/mcp-agent';
+import { ToolDefinition } from '@mcp-agent/core';
 import { AbstractBrowserControlStrategy } from './base-strategy';
 import { createContentTools } from '../tools';
 
@@ -52,7 +52,7 @@ export class BrowserUseOnlyStrategy extends AbstractBrowserControlStrategy {
       'browser_read_links',
 
       // Visual tools
-      'browser_screenshot',
+      // 'browser_screenshot',
 
       // Tab management
       'browser_tab_list',

@@ -7,13 +7,11 @@
 import {
   AgentRunObjectOptions,
   AgentRunStreamingOptions,
-  AssistantMessageEvent,
-  Event,
-  EventStream,
-  EventType,
+  AgentEventStream,
   ToolCallEngine,
   ToolCallEngineType,
   AgentContextAwarenessOptions,
+  AgentStatus,
 } from '@multimodal/agent-interface';
 import { ToolManager } from './tool-manager';
 import { ResolvedModel, LLMReasoningOptions } from '@multimodal/model-provider';
@@ -28,6 +26,7 @@ import { LLMProcessor } from './runner/llm-processor';
 import { ToolProcessor } from './runner/tool-processor';
 import { LoopExecutor } from './runner/loop-executor';
 import { StreamAdapter } from './runner/stream-adapter';
+import { AgentEventStreamProcessor } from './event-stream';
 
 /**
  * Runner configuration options
@@ -39,7 +38,7 @@ interface AgentRunnerOptions {
   temperature: number;
   reasoningOptions: LLMReasoningOptions;
   toolCallEngine?: ToolCallEngineType;
-  eventStream: EventStream;
+  eventStream: AgentEventStreamProcessor;
   toolManager: ToolManager;
   agent: Agent;
   contextAwarenessOptions?: AgentContextAwarenessOptions;
@@ -58,7 +57,7 @@ export class AgentRunner {
   private temperature: number;
   private reasoningOptions: LLMReasoningOptions;
   private toolCallEngine?: ToolCallEngine; // lazy init
-  private eventStream: EventStream;
+  private eventStream: AgentEventStreamProcessor;
   private toolManager: ToolManager;
   private agent: Agent;
   private contextAwarenessOptions?: AgentContextAwarenessOptions;
@@ -142,23 +141,81 @@ export class AgentRunner {
   }
 
   /**
+   * Handles errors from LLM processing and agent loop execution
+   * @param error The error that occurred
+   * @param resolvedModel The resolved model information
+   * @param sessionId The current session ID
+   * @param abortSignal Optional abort signal
+   * @returns An assistant message event with error information
+   */
+  private handleError(
+    error: unknown,
+    resolvedModel: ResolvedModel,
+    sessionId: string,
+    abortSignal?: AbortSignal,
+  ): AgentEventStream.AssistantMessageEvent {
+    // Check if this is an abort error
+    const isAbortError =
+      (error instanceof Error && error.name === 'AbortError') || abortSignal?.aborted;
+
+    if (isAbortError) {
+      this.logger.info(`[Session] Execution aborted | SessionId: "${sessionId}"`);
+
+      // Add system event for aborted request
+      const systemEvent = this.eventStream.createEvent('system', {
+        level: 'info',
+        message: `LLM request aborted`,
+        details: { provider: resolvedModel.provider },
+      });
+      this.eventStream.sendEvent(systemEvent);
+
+      // Return an abort message
+      return this.eventStream.createEvent('assistant_message', {
+        content: 'Request was aborted',
+        finishReason: 'abort',
+      });
+    } else {
+      // Handle other types of errors
+      this.logger.error(
+        `[Session] Error in execution | SessionId: "${sessionId}" | Error: ${error}`,
+      );
+
+      // Add system event for error
+      const systemEvent = this.eventStream.createEvent('system', {
+        level: 'error',
+        message: `LLM API error: ${error}`,
+        details: { error: String(error), provider: resolvedModel.provider },
+      });
+      this.eventStream.sendEvent(systemEvent);
+
+      // Add error message as assistant response
+      const errorMessage = `Sorry, an error occurred while processing your request: ${error}`;
+      return this.eventStream.createEvent('assistant_message', {
+        content: errorMessage,
+        finishReason: 'error',
+      });
+    }
+  }
+
+  /**
    * Executes the agent's reasoning loop in non-streaming mode
    *
    * @param runOptions Options for this execution
+   * @param resolvedModel The resolved model configuration
    * @param sessionId Unique session identifier
-   * @returns Final answer as an AssistantMessageEvent
+   * @returns Final answer as an AgentEventStream.AssistantMessageEvent
    */
   async execute(
     runOptions: AgentRunObjectOptions,
     resolvedModel: ResolvedModel,
     sessionId: string,
-  ): Promise<AssistantMessageEvent> {
+  ): Promise<AgentEventStream.AssistantMessageEvent> {
     // Resolve which model and provider to use
     const abortSignal = runOptions.abortSignal;
 
     this.logger.info(
       `[Session] Execution started | SessionId: "${sessionId}" | ` +
-        `Provider: "${resolvedModel.provider}" | Model: "${resolvedModel.model}" | ` +
+        `Provider: "${resolvedModel.provider}" | Model: "${resolvedModel.id}" | ` +
         `Mode: non-streaming`,
     );
 
@@ -168,14 +225,14 @@ export class AgentRunner {
         this.logger.warn(`[Session] Execution aborted before starting | SessionId: "${sessionId}"`);
 
         // Create system event for aborted execution
-        const systemEvent = this.eventStream.createEvent(EventType.SYSTEM, {
+        const systemEvent = this.eventStream.createEvent('system', {
           level: 'warning',
           message: 'Execution aborted',
         });
         this.eventStream.sendEvent(systemEvent);
 
         // Return minimal response
-        return this.eventStream.createEvent(EventType.ASSISTANT_MESSAGE, {
+        return this.eventStream.createEvent('assistant_message', {
           content: 'Request was aborted',
           finishReason: 'abort',
         });
@@ -186,14 +243,19 @@ export class AgentRunner {
       const toolCallEngine = this.createToolCallEngine(toolCallEngineType);
       this.logger.info(`Using tool call engine: ${toolCallEngineType}`);
 
-      // Execute the agent loop with abort signal
-      return await this.loopExecutor.executeLoop(
-        resolvedModel,
-        sessionId,
-        toolCallEngine,
-        false, // Non-streaming mode
-        abortSignal,
-      );
+      try {
+        // Execute the agent loop with abort signal
+        return await this.loopExecutor.executeLoop(
+          resolvedModel,
+          sessionId,
+          toolCallEngine,
+          false, // Non-streaming mode
+          abortSignal,
+        );
+      } catch (error) {
+        // Handle LLM and execution errors
+        return this.handleError(error, resolvedModel, sessionId, abortSignal);
+      }
     } finally {
       await this.agent.onAgentLoopEnd(sessionId);
     }
@@ -203,6 +265,7 @@ export class AgentRunner {
    * Executes the agent's reasoning loop in streaming mode
    *
    * @param runOptions Options for this execution
+   * @param resolvedModel The resolved model configuration
    * @param sessionId Unique session identifier
    * @returns AsyncIterable of streaming events
    */
@@ -210,13 +273,13 @@ export class AgentRunner {
     runOptions: AgentRunStreamingOptions,
     resolvedModel: ResolvedModel,
     sessionId: string,
-  ): Promise<AsyncIterable<Event>> {
+  ): Promise<AsyncIterable<AgentEventStream.Event>> {
     // Resolve which model and provider to use
     const abortSignal = runOptions.abortSignal;
 
     this.logger.info(
       `[Session] Execution started | SessionId: "${sessionId}" | ` +
-        `Provider: "${resolvedModel.provider}" | Model: "${resolvedModel.model}" | ` +
+        `Provider: "${resolvedModel.provider}" | Model: "${resolvedModel.id}" | ` +
         `Mode: streaming`,
     );
 
@@ -252,18 +315,21 @@ export class AgentRunner {
         return finalEvent;
       })
       .catch((error) => {
-        // Check if this was an abort
+        // Handle errors in execution
         if (abortSignal?.aborted) {
           this.logger.info(`[Stream] Agent loop execution aborted`);
           this.streamAdapter.abortStream();
         } else {
           // Handle other errors during execution
           this.logger.error(`[Stream] Error in agent loop execution: ${error}`);
-        }
 
-        // Rethrow if not an abort
-        if (!abortSignal?.aborted) {
-          throw error;
+          // Create system error event
+          const systemEvent = this.eventStream.createEvent('system', {
+            level: 'error',
+            message: `Error in agent execution: ${error}`,
+            details: { error: String(error), provider: resolvedModel.provider },
+          });
+          this.eventStream.sendEvent(systemEvent);
         }
       })
       .finally(async () => {
